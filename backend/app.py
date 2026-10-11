@@ -1,761 +1,106 @@
 import os
+from contextlib import contextmanager
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from psycopg2 import IntegrityError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-
-# ============================================================
-# LOAD ENVIRONMENT VARIABLES
-# ============================================================
-
 load_dotenv()
 
-
-# ============================================================
-# FLASK APPLICATION
-# ============================================================
-
 app = Flask(__name__)
-
-CORS(
-    app,
-    resources={
-        r"/api/*": {
-            "origins": "*"
-        }
-    }
-)
+CORS(app)
 
 
-# ============================================================
-# DATABASE CONFIGURATION
-# ============================================================
-
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432"),
-    "database": os.getenv("DB_NAME", "hostel_management"),
-    "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "Akshay@2007")
-}
-
-
-# ============================================================
+# =========================================================
 # DATABASE CONNECTION
-# ============================================================
+# =========================================================
 
 def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=os.getenv("DB_NAME", "hostel_management"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", ""),
+        cursor_factory=RealDictCursor,
+    )
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.route("/api/health", methods=["GET"])
-def health_check():
-
-    try:
-
-        connection = get_connection()
-
-        cursor = connection.cursor()
-
-        cursor.execute("SELECT 1;")
-
-        cursor.fetchone()
-
-        cursor.close()
-
-        connection.close()
-
-        return jsonify({
-            "success": True,
-            "message": "Flask backend and PostgreSQL are connected"
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "success": False,
-            "message": "Database connection failed",
-            "error": str(error)
-        }), 500
-
-
-# ============================================================
-# DASHBOARD
-# ============================================================
-
-@app.route("/api/dashboard", methods=["GET"])
-def dashboard():
-
-    connection = None
-    cursor = None
+@contextmanager
+def db_connection():
+    conn = get_connection()
 
     try:
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            SELECT
-                (SELECT COUNT(*) FROM students) AS total_students,
-
-                (SELECT COUNT(*) FROM rooms) AS total_rooms,
-
-                (
-                    SELECT COUNT(*)
-                    FROM allocations
-                    WHERE status = 'ACTIVE'
-                ) AS active_allocations,
-
-                (
-                    SELECT COALESCE(SUM(capacity), 0)
-                    FROM rooms
-                )
-                -
-                (
-                    SELECT COUNT(*)
-                    FROM allocations
-                    WHERE status = 'ACTIVE'
-                ) AS available_beds;
-        """)
-
-        result = cursor.fetchone()
-
-        return jsonify({
-            "success": True,
-            "data": result
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
+        with conn:
+            yield conn
     finally:
+        conn.close()
 
-        if cursor:
-            cursor.close()
 
-        if connection:
-            connection.close()
+# =========================================================
+# JSON RESPONSES
+# =========================================================
 
+def success(data=None, message="OK", status=200):
+    return jsonify({
+        "success": True,
+        "message": message,
+        "data": data
+    }), status
 
-# ============================================================
-# GET ALL STUDENTS
-# ============================================================
 
-@app.route("/api/students", methods=["GET"])
-def get_students():
+def failure(message, status=400):
+    return jsonify({
+        "success": False,
+        "message": message
+    }), status
 
-    connection = None
-    cursor = None
 
-    try:
+def row_to_json(row):
+    if row is None:
+        return None
 
-        connection = get_connection()
+    result = {}
 
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
+    for key, value in dict(row).items():
+        if isinstance(value, Decimal):
+            result[key] = float(value)
+        elif hasattr(value, "isoformat"):
+            result[key] = value.isoformat()
+        else:
+            result[key] = value
 
-        cursor.execute("""
-            SELECT
-                student_id,
-                roll_no,
-                name,
-                gender,
-                phone,
-                email,
-                department,
-                year_of_study
-            FROM students
-            ORDER BY student_id;
-        """)
+    return result
 
-        students = cursor.fetchall()
 
-        return jsonify({
-            "success": True,
-            "data": students
-        })
+def rows_to_json(rows):
+    return [row_to_json(row) for row in rows]
 
-    except Exception as error:
 
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
+def database_error_message(exc):
+    if isinstance(exc, psycopg2.errors.UniqueViolation):
+        return "A record with a duplicate unique value already exists."
 
-    finally:
+    if isinstance(exc, psycopg2.errors.ForeignKeyViolation):
+        return "The selected student or room does not exist."
 
-        if cursor:
-            cursor.close()
+    if isinstance(exc, psycopg2.errors.CheckViolation):
+        return "One or more values violate a database validation rule."
 
-        if connection:
-            connection.close()
+    app.logger.exception("Database operation failed")
+    return "Database operation failed. Check the backend terminal."
 
 
-# ============================================================
-# ADD STUDENT
-# ============================================================
+# =========================================================
+# HOME AND HEALTH CHECK
+# =========================================================
 
-@app.route("/api/students", methods=["POST"])
-def add_student():
-
-    connection = None
-    cursor = None
-
-    try:
-
-        data = request.get_json()
-
-        required_fields = [
-            "roll_no",
-            "name",
-            "gender",
-            "phone",
-            "email",
-            "department",
-            "year_of_study"
-        ]
-
-        for field in required_fields:
-
-            if field not in data or str(data[field]).strip() == "":
-
-                return jsonify({
-                    "success": False,
-                    "message": f"{field} is required"
-                }), 400
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            INSERT INTO students
-            (
-                roll_no,
-                name,
-                gender,
-                phone,
-                email,
-                department,
-                year_of_study
-            )
-            VALUES
-            (
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s
-            )
-            RETURNING
-                student_id,
-                roll_no,
-                name,
-                gender,
-                phone,
-                email,
-                department,
-                year_of_study;
-        """, (
-            data["roll_no"],
-            data["name"],
-            data["gender"],
-            data["phone"],
-            data["email"],
-            data["department"],
-            int(data["year_of_study"])
-        ))
-
-        student = cursor.fetchone()
-
-        connection.commit()
-
-        return jsonify({
-            "success": True,
-            "message": "Student added successfully",
-            "data": student
-        }), 201
-
-    except IntegrityError as error:
-
-        if connection:
-            connection.rollback()
-
-        return jsonify({
-            "success": False,
-            "message": "Student could not be added. Roll number, phone or email may already exist.",
-            "error": str(error)
-        }), 409
-
-    except Exception as error:
-
-        if connection:
-            connection.rollback()
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if connection:
-            connection.close()
-
-
-# ============================================================
-# GET ALL ROOMS
-# ============================================================
-
-@app.route("/api/rooms", methods=["GET"])
-def get_rooms():
-
-    connection = None
-    cursor = None
-
-    try:
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            SELECT
-                r.room_id,
-                r.room_number,
-                r.floor_number,
-                r.capacity,
-                r.room_type,
-
-                COUNT(a.allocation_id)
-                FILTER (WHERE a.status = 'ACTIVE')
-                AS occupied_beds,
-
-                r.capacity -
-                COUNT(a.allocation_id)
-                FILTER (WHERE a.status = 'ACTIVE')
-                AS available_beds
-
-            FROM rooms r
-
-            LEFT JOIN allocations a
-                ON r.room_id = a.room_id
-
-            GROUP BY
-                r.room_id,
-                r.room_number,
-                r.floor_number,
-                r.capacity,
-                r.room_type
-
-            ORDER BY r.room_id;
-        """)
-
-        rooms = cursor.fetchall()
-
-        return jsonify({
-            "success": True,
-            "data": rooms
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if connection:
-            connection.close()
-
-
-# ============================================================
-# GET ALL ALLOCATIONS
-# ============================================================
-
-@app.route("/api/allocations", methods=["GET"])
-def get_allocations():
-
-    connection = None
-    cursor = None
-
-    try:
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            SELECT
-                a.allocation_id,
-                a.student_id,
-                a.room_id,
-                a.bed_number,
-                a.allocation_date,
-                a.status,
-
-                s.roll_no,
-                s.name AS student_name,
-
-                r.room_number,
-                r.room_type
-
-            FROM allocations a
-
-            JOIN students s
-                ON a.student_id = s.student_id
-
-            JOIN rooms r
-                ON a.room_id = r.room_id
-
-            ORDER BY
-                a.allocation_id;
-        """)
-
-        allocations = cursor.fetchall()
-
-        return jsonify({
-            "success": True,
-            "data": allocations
-        })
-
-    except Exception as error:
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if connection:
-            connection.close()
-
-
-# ============================================================
-# CREATE ROOM ALLOCATION
-# ============================================================
-
-@app.route("/api/allocations", methods=["POST"])
-def create_allocation():
-
-    connection = None
-    cursor = None
-
-    try:
-
-        data = request.get_json()
-
-        required_fields = [
-            "student_id",
-            "room_id",
-            "bed_number"
-        ]
-
-        for field in required_fields:
-
-            if field not in data:
-
-                return jsonify({
-                    "success": False,
-                    "message": f"{field} is required"
-                }), 400
-
-        student_id = int(data["student_id"])
-        room_id = int(data["room_id"])
-        bed_number = int(data["bed_number"])
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        # ----------------------------------------------------
-        # LOCK THE ROOM
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            SELECT
-                room_id,
-                room_number,
-                capacity
-            FROM rooms
-            WHERE room_id = %s
-            FOR UPDATE;
-        """, (room_id,))
-
-        room = cursor.fetchone()
-
-        if not room:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": "Room not found"
-            }), 404
-
-        # ----------------------------------------------------
-        # VALIDATE BED NUMBER
-        # ----------------------------------------------------
-
-        if bed_number < 1 or bed_number > room["capacity"]:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": f"Invalid bed number. Room {room['room_number']} has {room['capacity']} beds."
-            }), 400
-
-        # ----------------------------------------------------
-        # CHECK STUDENT EXISTS
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            SELECT student_id, name
-            FROM students
-            WHERE student_id = %s;
-        """, (student_id,))
-
-        student = cursor.fetchone()
-
-        if not student:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": "Student not found"
-            }), 404
-
-        # ----------------------------------------------------
-        # CHECK STUDENT ACTIVE ALLOCATION
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            SELECT allocation_id
-            FROM allocations
-            WHERE student_id = %s
-              AND status = 'ACTIVE'
-            FOR UPDATE;
-        """, (student_id,))
-
-        existing_student_allocation = cursor.fetchone()
-
-        if existing_student_allocation:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": "Student already has an active allocation"
-            }), 409
-
-        # ----------------------------------------------------
-        # CHECK BED OCCUPANCY
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            SELECT allocation_id
-            FROM allocations
-            WHERE room_id = %s
-              AND bed_number = %s
-              AND status = 'ACTIVE'
-            FOR UPDATE;
-        """, (
-            room_id,
-            bed_number
-        ))
-
-        existing_bed = cursor.fetchone()
-
-        if existing_bed:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": f"Bed {bed_number} in Room {room['room_number']} is already occupied"
-            }), 409
-
-        # ----------------------------------------------------
-        # CREATE ALLOCATION
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            INSERT INTO allocations
-            (
-                student_id,
-                room_id,
-                bed_number,
-                allocation_date,
-                status
-            )
-            VALUES
-            (
-                %s,
-                %s,
-                %s,
-                CURRENT_DATE,
-                'ACTIVE'
-            )
-            RETURNING
-                allocation_id,
-                student_id,
-                room_id,
-                bed_number,
-                allocation_date,
-                status;
-        """, (
-            student_id,
-            room_id,
-            bed_number
-        ))
-
-        allocation = cursor.fetchone()
-
-        connection.commit()
-
-        return jsonify({
-            "success": True,
-            "message": "Bed allocated successfully",
-            "data": allocation
-        }), 201
-
-    except IntegrityError as error:
-
-        if connection:
-            connection.rollback()
-
-        return jsonify({
-            "success": False,
-            "message": "Allocation conflict. The student or bed may already be allocated.",
-            "error": str(error)
-        }), 409
-
-    except Exception as error:
-
-        if connection:
-            connection.rollback()
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if connection:
-            connection.close()
-
-
-# ============================================================
-# CANCEL ALLOCATION
-# ============================================================
-
-@app.route("/api/allocations/<int:allocation_id>/cancel", methods=["PATCH"])
-def cancel_allocation(allocation_id):
-
-    connection = None
-    cursor = None
-
-    try:
-
-        connection = get_connection()
-
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        cursor.execute("""
-            UPDATE allocations
-
-            SET status = 'CANCELLED'
-
-            WHERE allocation_id = %s
-              AND status = 'ACTIVE'
-
-            RETURNING
-                allocation_id,
-                student_id,
-                room_id,
-                bed_number,
-                allocation_date,
-                status;
-        """, (allocation_id,))
-
-        allocation = cursor.fetchone()
-
-        if not allocation:
-
-            connection.rollback()
-
-            return jsonify({
-                "success": False,
-                "message": "Active allocation not found"
-            }), 404
-
-        connection.commit()
-
-        return jsonify({
-            "success": True,
-            "message": "Allocation cancelled successfully",
-            "data": allocation
-        })
-
-    except Exception as error:
-
-        if connection:
-            connection.rollback()
-
-        return jsonify({
-            "success": False,
-            "message": str(error)
-        }), 500
-
-    finally:
-
-        if cursor:
-            cursor.close()
-
-        if connection:
-            connection.close()
-
-
-# ============================================================
-# ROOT API
-# ============================================================
-
-@app.route("/", methods=["GET"])
-def home():
-
+@app.get("/")
+def index():
     return jsonify({
         "application": "Hostel Management System",
         "backend": "Flask REST API",
@@ -764,41 +109,636 @@ def home():
     })
 
 
-# ============================================================
-# ERROR HANDLER
-# ============================================================
+@app.get("/api/health")
+def health():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
 
-@app.errorhandler(404)
-def not_found(error):
+        return jsonify({
+            "success": True,
+            "status": "healthy",
+            "database": "connected"
+        })
 
-    return jsonify({
-        "success": False,
-        "message": "API endpoint not found"
-    }), 404
+    except Exception as exc:
+        app.logger.exception("Health check failed")
+
+        return jsonify({
+            "success": False,
+            "status": "unhealthy",
+            "message": str(exc)
+        }), 500
 
 
-# ============================================================
+# =========================================================
+# STUDENTS
+# =========================================================
+
+@app.get("/api/students")
+def get_students():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        student_id,
+                        roll_no,
+                        name,
+                        gender,
+                        phone,
+                        email,
+                        department,
+                        year_of_study
+                    FROM students
+                    ORDER BY student_id
+                """)
+
+                rows = cur.fetchall()
+
+        return success(rows_to_json(rows))
+
+    except Exception as exc:
+        app.logger.exception("Get students failed")
+        return failure(str(exc), 500)
+
+
+@app.post("/api/students")
+def create_student():
+    data = request.get_json(silent=True) or {}
+
+    required = [
+        "roll_no", "name", "gender", "phone",
+        "email", "department", "year_of_study"
+    ]
+
+    if any(data.get(key) in (None, "") for key in required):
+        return failure("All student fields are required.")
+
+    try:
+        year = int(data["year_of_study"])
+
+        if year not in (1, 2, 3, 4):
+            return failure("Year of study must be between 1 and 4.")
+
+        if data["gender"] not in ("Male", "Female"):
+            return failure("Gender must be Male or Female.")
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO students (
+                        roll_no,
+                        name,
+                        gender,
+                        phone,
+                        email,
+                        department,
+                        year_of_study
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                """, (
+                    data["roll_no"].strip(),
+                    data["name"].strip(),
+                    data["gender"],
+                    data["phone"].strip(),
+                    data["email"].strip().lower(),
+                    data["department"].strip(),
+                    year
+                ))
+
+                saved = row_to_json(cur.fetchone())
+
+        return success(saved, "Student created", 201)
+
+    except (TypeError, ValueError):
+        return failure("Year of study must be a valid number.")
+
+    except psycopg2.Error as exc:
+        return failure(
+            database_error_message(exc),
+            409 if isinstance(exc, psycopg2.errors.UniqueViolation) else 400
+        )
+
+    except Exception as exc:
+        app.logger.exception("Create student failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# ROOMS
+# =========================================================
+
+@app.get("/api/rooms")
+def get_rooms():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        r.room_id,
+                        r.room_number,
+                        r.floor_number,
+                        r.capacity,
+                        r.room_type,
+                        COUNT(a.allocation_id)
+                            FILTER (WHERE a.status = 'ACTIVE')::int
+                            AS occupied_beds,
+                        (
+                            r.capacity -
+                            COUNT(a.allocation_id)
+                                FILTER (WHERE a.status = 'ACTIVE')
+                        )::int AS available_beds
+                    FROM rooms r
+                    LEFT JOIN allocations a
+                        ON a.room_id = r.room_id
+                    GROUP BY r.room_id
+                    ORDER BY r.room_id
+                """)
+
+                rows = cur.fetchall()
+
+        return success(rows_to_json(rows))
+
+    except Exception as exc:
+        app.logger.exception("Get rooms failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# ALLOCATIONS
+# =========================================================
+
+@app.get("/api/allocations")
+def get_allocations():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        allocation_id,
+                        student_id,
+                        room_id,
+                        bed_number,
+                        allocation_date,
+                        status
+                    FROM allocations
+                    ORDER BY allocation_id DESC
+                """)
+
+                rows = cur.fetchall()
+
+        return success(rows_to_json(rows))
+
+    except Exception as exc:
+        app.logger.exception("Get allocations failed")
+        return failure(str(exc), 500)
+
+
+@app.post("/api/allocations")
+def create_allocation():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        student_id = int(data.get("student_id"))
+        room_id = int(data.get("room_id"))
+        bed_number = int(data.get("bed_number"))
+
+        if bed_number < 1:
+            return failure("Bed number must be at least 1.")
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT capacity
+                    FROM rooms
+                    WHERE room_id = %s
+                    FOR UPDATE
+                """, (room_id,))
+
+                room = cur.fetchone()
+
+                if not room:
+                    return failure("Room not found.", 404)
+
+                if bed_number > room["capacity"]:
+                    return failure("Bed number exceeds room capacity.")
+
+                cur.execute("""
+                    SELECT 1
+                    FROM students
+                    WHERE student_id = %s
+                """, (student_id,))
+
+                if not cur.fetchone():
+                    return failure("Student not found.", 404)
+
+                cur.execute("""
+                    SELECT 1
+                    FROM allocations
+                    WHERE student_id = %s
+                      AND status = 'ACTIVE'
+                """, (student_id,))
+
+                if cur.fetchone():
+                    return failure(
+                        "This student already has an active allocation.",
+                        409
+                    )
+
+                cur.execute("""
+                    SELECT 1
+                    FROM allocations
+                    WHERE room_id = %s
+                      AND bed_number = %s
+                      AND status = 'ACTIVE'
+                """, (room_id, bed_number))
+
+                if cur.fetchone():
+                    return failure("That bed is already occupied.", 409)
+
+                cur.execute("""
+                    INSERT INTO allocations (
+                        student_id,
+                        room_id,
+                        bed_number,
+                        status
+                    )
+                    VALUES (%s, %s, %s, 'ACTIVE')
+                    RETURNING *
+                """, (student_id, room_id, bed_number))
+
+                saved = row_to_json(cur.fetchone())
+
+        return success(saved, "Allocation created", 201)
+
+    except (TypeError, ValueError):
+        return failure("Student, room, and bed must be valid numbers.")
+
+    except psycopg2.Error as exc:
+        return failure(
+            database_error_message(exc),
+            409 if isinstance(exc, psycopg2.errors.UniqueViolation) else 400
+        )
+
+    except Exception as exc:
+        app.logger.exception("Create allocation failed")
+        return failure(str(exc), 500)
+
+
+@app.patch("/api/allocations/<int:allocation_id>/cancel")
+def cancel_allocation(allocation_id):
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE allocations
+                    SET status = 'CANCELLED'
+                    WHERE allocation_id = %s
+                      AND status = 'ACTIVE'
+                    RETURNING allocation_id, status
+                """, (allocation_id,))
+
+                row = cur.fetchone()
+
+                if not row:
+                    return failure("Active allocation not found.", 404)
+
+                saved = row_to_json(row)
+
+        return success(saved, "Allocation cancelled")
+
+    except Exception as exc:
+        app.logger.exception("Cancel allocation failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# PAYMENTS: LIST AND CREATE
+# =========================================================
+
+@app.get("/api/payments")
+def get_payments():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        p.payment_id,
+                        p.student_id,
+                        s.roll_no,
+                        s.name AS student_name,
+                        p.amount,
+                        p.payment_date,
+                        p.payment_method,
+                        p.reference_no,
+                        p.status,
+                        p.created_at
+                    FROM payments p
+                    JOIN students s
+                        ON s.student_id = p.student_id
+                    ORDER BY p.payment_date DESC, p.payment_id DESC
+                """)
+
+                rows = cur.fetchall()
+
+        return success(rows_to_json(rows))
+
+    except Exception as exc:
+        app.logger.exception("Get payments failed")
+        return failure(str(exc), 500)
+
+
+@app.post("/api/payments")
+def create_payment():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        student_id = int(data.get("student_id"))
+        amount = Decimal(str(data.get("amount")))
+
+        if not amount.is_finite() or amount <= 0:
+            return failure("Payment amount must be greater than zero.")
+
+        payment_date = (
+            date.fromisoformat(data["payment_date"])
+            if data.get("payment_date")
+            else date.today()
+        )
+
+        method = str(data.get("payment_method", "")).strip()
+
+        allowed_methods = {
+            "UPI", "Cash", "Card", "Bank Transfer", "Other"
+        }
+
+        if method not in allowed_methods:
+            return failure("Choose a valid payment method.")
+
+        reference = (data.get("reference_no") or "").strip() or None
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO payments (
+                        student_id,
+                        amount,
+                        payment_date,
+                        payment_method,
+                        reference_no,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'PAID')
+                    RETURNING *
+                """, (
+                    student_id,
+                    amount,
+                    payment_date,
+                    method,
+                    reference
+                ))
+
+                saved = row_to_json(cur.fetchone())
+
+        return success(saved, "Payment recorded", 201)
+
+    except (TypeError, ValueError, InvalidOperation):
+        return failure("Enter a valid student, amount, and payment date.")
+
+    except psycopg2.Error as exc:
+        return failure(database_error_message(exc), 400)
+
+    except Exception as exc:
+        app.logger.exception("Create payment failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# MAINTENANCE: LIST AND CREATE
+# =========================================================
+
+@app.get("/api/maintenance")
+def get_maintenance():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        m.maintenance_id,
+                        m.room_id,
+                        r.room_number,
+                        m.student_id,
+                        s.name AS student_name,
+                        m.title,
+                        m.description,
+                        m.category,
+                        m.priority,
+                        m.status,
+                        m.created_at,
+                        m.updated_at
+                    FROM maintenance_requests m
+                    JOIN rooms r
+                        ON r.room_id = m.room_id
+                    LEFT JOIN students s
+                        ON s.student_id = m.student_id
+                    ORDER BY
+                        CASE m.status
+                            WHEN 'PENDING' THEN 0
+                            WHEN 'IN_PROGRESS' THEN 1
+                            ELSE 2
+                        END,
+                        m.created_at DESC
+                """)
+
+                rows = cur.fetchall()
+
+        return success(rows_to_json(rows))
+
+    except Exception as exc:
+        app.logger.exception("Get maintenance failed")
+        return failure(str(exc), 500)
+
+
+@app.post("/api/maintenance")
+def create_maintenance():
+    data = request.get_json(silent=True) or {}
+
+    required = [
+        "room_id", "title", "description", "category", "priority"
+    ]
+
+    if any(data.get(key) in (None, "") for key in required):
+        return failure("Room, title, description, category, and priority are required.")
+
+    try:
+        room_id = int(data["room_id"])
+
+        student_id = (
+            int(data["student_id"])
+            if data.get("student_id") not in (None, "")
+            else None
+        )
+
+        title = str(data["title"]).strip()
+        description = str(data["description"]).strip()
+        category = str(data["category"]).strip()
+        priority = str(data["priority"]).upper()
+
+        if not title or not description or not category:
+            return failure("Title, description, and category cannot be empty.")
+
+        if priority not in {"LOW", "MEDIUM", "HIGH", "URGENT"}:
+            return failure("Choose a valid priority.")
+
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO maintenance_requests (
+                        room_id,
+                        student_id,
+                        title,
+                        description,
+                        category,
+                        priority,
+                        status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
+                    RETURNING *
+                """, (
+                    room_id,
+                    student_id,
+                    title,
+                    description,
+                    category,
+                    priority
+                ))
+
+                saved = row_to_json(cur.fetchone())
+
+        return success(saved, "Maintenance request created", 201)
+
+    except (TypeError, ValueError):
+        return failure("Room or student selection is invalid.")
+
+    except psycopg2.Error as exc:
+        return failure(database_error_message(exc), 400)
+
+    except Exception as exc:
+        app.logger.exception("Create maintenance failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# MAINTENANCE: UPDATE STATUS
+# =========================================================
+
+@app.patch("/api/maintenance/<int:maintenance_id>")
+def update_maintenance(maintenance_id):
+    data = request.get_json(silent=True) or {}
+    status = str(data.get("status", "")).upper()
+
+    allowed_statuses = {
+        "PENDING", "IN_PROGRESS", "COMPLETED"
+    }
+
+    if status not in allowed_statuses:
+        return failure("Choose a valid maintenance status.")
+
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE maintenance_requests
+                    SET
+                        status = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE maintenance_id = %s
+                    RETURNING maintenance_id, status, updated_at
+                """, (status, maintenance_id))
+
+                row = cur.fetchone()
+
+                if not row:
+                    return failure("Maintenance request not found.", 404)
+
+                saved = row_to_json(row)
+
+        return success(saved, "Maintenance status updated")
+
+    except Exception as exc:
+        app.logger.exception("Update maintenance failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
+# ADMINISTRATION: LIVE SYSTEM SUMMARY
+# =========================================================
+
+@app.get("/api/admin/summary")
+def admin_summary():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        (
+                            SELECT COUNT(*)
+                            FROM students
+                        )::int AS total_students,
+
+                        (
+                            SELECT COUNT(*)
+                            FROM rooms
+                        )::int AS total_rooms,
+
+                        (
+                            SELECT COUNT(*)
+                            FROM allocations
+                            WHERE status = 'ACTIVE'
+                        )::int AS active_allocations,
+
+                        (
+                            SELECT COALESCE(SUM(capacity), 0)
+                            FROM rooms
+                        )::int AS total_beds,
+
+                        (
+                            SELECT COUNT(*)
+                            FROM payments
+                            WHERE status = 'PAID'
+                        )::int AS paid_transactions,
+
+                        (
+                            SELECT COALESCE(SUM(amount), 0)
+                            FROM payments
+                            WHERE status = 'PAID'
+                        ) AS total_collected,
+
+                        (
+                            SELECT COUNT(*)
+                            FROM maintenance_requests
+                            WHERE status <> 'COMPLETED'
+                        )::int AS open_maintenance
+                """)
+
+                summary = row_to_json(cur.fetchone())
+
+        return success(summary)
+
+    except Exception as exc:
+        app.logger.exception("Administration summary failed")
+        return failure(str(exc), 500)
+
+
+# =========================================================
 # START SERVER
-# ============================================================
+# =========================================================
 
 if __name__ == "__main__":
-
     host = os.getenv("FLASK_HOST", "127.0.0.1")
     port = int(os.getenv("FLASK_PORT", "5000"))
 
-    print()
-    print("=" * 60)
-    print("HOSTEL MANAGEMENT SYSTEM")
-    print("Flask Backend")
-    print("=" * 60)
-    print(f"Server: http://{host}:{port}")
-    print("Database: PostgreSQL")
-    print("Database name:", DB_CONFIG["database"])
-    print("=" * 60)
-    print()
-
-    app.run(
-        host=host,
-        port=port,
-        debug=True
-    )
+    app.run(host=host, port=port, debug=True)
